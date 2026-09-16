@@ -47,25 +47,20 @@ class SPTDASStorage:
         Create indexes on first run. Safe to call repeatedly — MongoDB
         ignores index creation if it already exists.
         """
-        # products: unique on item_id
         self._db.products.create_index(
             [("item_id", ASCENDING)], unique=True, name="idx_item_id"
         )
-        # price_history: dedup index
         self._db.price_history.create_index(
             [("item_id", ASCENDING), ("scraped_at", DESCENDING)],
             name="idx_item_scraped",
         )
-        # price_history: fast lookup of all-time minimum
         self._db.price_history.create_index(
             [("item_id", ASCENDING), ("current_price", ASCENDING)],
             name="idx_item_price",
         )
-        # crawl_logs: chronological
         self._db.crawl_logs.create_index(
             [("started_at", DESCENDING)], name="idx_crawl_time"
         )
-        # errors: fast admin lookup
         self._db.errors.create_index(
             [("crawl_run_id", ASCENDING), ("category", ASCENDING)],
             name="idx_error_run",
@@ -133,6 +128,12 @@ class SPTDASStorage:
              — but ONLY if no entry for this item_id exists within the same
                crawl run (prevents duplication if the crawler retries)
 
+        Every price_history document is tagged with a `source` field —
+        "crawler" for real automated scrapes, or whatever the caller passes
+        (e.g. "manual_demo" from the admin dashboard's simulate-price
+        endpoint) — so real vs. manually-inserted data is always
+        distinguishable in the database.
+
         Returns stats dict: {new, updated, skipped, errors}
         """
         stats = {"new": 0, "updated": 0, "skipped": 0, "errors": 0}
@@ -191,6 +192,7 @@ class SPTDASStorage:
                     "is_promotional": product.get("is_promotional", False),
                     "category":       product.get("category"),
                     "is_delisted":    product.get("is_delisted", False),
+                    "source":         product.get("source", "crawler"),
                 }
                 self._db.price_history.insert_one(history_doc)
 
@@ -225,10 +227,6 @@ class SPTDASStorage:
     def get_all_tracked_urls(self) -> list[dict]:
         """
         TRACKING MODE — return url + category for every non-delisted product.
-
-        Called by orchestrator at the start of a tracking-mode run to get the
-        full basket of products to re-scrape. Returns only the fields the
-        crawler needs; _id is excluded.
         """
         return list(
             self._db.products.find(
@@ -261,8 +259,6 @@ class SPTDASStorage:
     def get_products_with_min_history(self, min_entries: int = 7) -> list[dict]:
         """
         Return products that have at least `min_entries` price history records.
-        Used by the deal engine — we require minimum 7 data points before
-        calling a price an 'all-time low' (prevents false alerts on day 1).
         """
         pipeline = [
             {"$group": {"_id": "$item_id", "count": {"$sum": 1}}},

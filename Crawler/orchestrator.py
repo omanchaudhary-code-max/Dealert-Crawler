@@ -17,28 +17,13 @@ def run_crawl() -> bool:
     Execute one full crawl cycle across all configured categories.
 
     MODE is controlled by the CRAWL_MODE env var:
-
-      discovery (default, Phase 1 — now → July 15)
-        Walks Daraz category listing pages to find new product URLs, scrapes
-        each one, and saves to MongoDB. Run this until your basket has
-        200–300 products per category.
-
-      tracking (Phase 2 — July 15 → July 30)
-        Pulls every known product URL from MongoDB and re-scrapes it for a
-        fresh price snapshot. No listing page navigation at all. This builds
-        the deep price history your charts, all-time-low detection, and
-        wishlist alerts depend on.
-
-    Switch CRAWL_MODE=tracking in your .env or GitHub Actions env on July 15.
-
-    Each product is saved to MongoDB immediately after scraping — so if the
-    crawler crashes on product 35 of 50, products 1–34 are already in the DB.
+      discovery — walk category listing pages, find new product URLs, scrape.
+      tracking  — re-scrape every known product URL from MongoDB.
 
     Returns True if the run completed without a fatal error,
     False only if MongoDB is unreachable or the run catastrophically fails.
     """
 
-    # ── Config from .env ────────────────────────────────────────────────────────
     mongo_uri    = os.getenv("MONGO_URI",    "mongodb://localhost:27017")
     db_name      = os.getenv("MONGO_DB",     "daraz_db")
     delay_min    = int(os.getenv("DELAY_MIN",    "10"))
@@ -64,7 +49,6 @@ def run_crawl() -> bool:
         logger.error(f"Unknown CRAWL_MODE '{crawl_mode}'. Must be 'discovery' or 'tracking'.")
         return False
 
-    # ── Connect to MongoDB ──────────────────────────────────────────────────────
     storage = SPTDASStorage(uri=mongo_uri, db_name=db_name)
     try:
         storage.connect()
@@ -82,13 +66,9 @@ def run_crawl() -> bool:
     }
     category_results = {}
 
-    # ── Crawl ───────────────────────────────────────────────────────────────────
     try:
         with DarazCrawler(delay_min=delay_min, delay_max=delay_max) as crawler:
 
-            # ── TRACKING MODE ────────────────────────────────────────────────
-            # Pull all known products from MongoDB and re-scrape them in one
-            # pass. We still group results by category for the summary log.
             if crawl_mode == "tracking":
                 logger.info("TRACKING MODE — loading known products from MongoDB...")
                 all_known = storage.get_all_tracked_urls()
@@ -102,7 +82,6 @@ def run_crawl() -> bool:
                     storage.finish_crawl_run(run_id, total_stats)
                     return True
 
-                # Initialise per-category stats buckets
                 for cat in categories:
                     category_results[cat] = {"scraped": 0, "new": 0, "updated": 0, "errors": 0}
                 category_results["_other"] = {"scraped": 0, "new": 0, "updated": 0, "errors": 0}
@@ -131,15 +110,12 @@ def run_crawl() -> bool:
                 save_cb = make_tracking_save_callback(category_results)
                 crawler.crawl_known_products(all_known, save_callback=save_cb)
 
-                # Roll up stats from all categories
                 for cat, stats in category_results.items():
                     total_stats["total_products"] += stats["scraped"]
                     total_stats["total_new"]      += stats["new"]
                     total_stats["total_updated"]  += stats["updated"]
                     total_stats["total_errors"]   += stats["errors"]
 
-            # ── DISCOVERY MODE ───────────────────────────────────────────────
-            # Walk listing pages per category, find new URLs, scrape them.
             else:
                 for category in categories:
                     logger.info(f"\n>>> Starting category: {category}")
@@ -194,13 +170,12 @@ def run_crawl() -> bool:
 
                         logger.info(
                             f"  Category summary — {category}: "
-                            f"scraped={cat_stats['scraped']}, "
-                            f"new={cat_stats['new']}, "
-                            f"updated={cat_stats['updated']}, "
-                            f"errors={cat_stats['errors']}"
+                            f"scraped={cat_stats['scraped']:3d}, "
+                            f"new={cat_stats['new']:3d}, "
+                            f"updated={cat_stats['updated']:3d}, "
+                            f"errors={cat_stats['errors']:3d}"
                         )
 
-        # ── Finish ──────────────────────────────────────────────────────────────
         storage.finish_crawl_run(run_id, total_stats)
 
         logger.info("\n" + "=" * 60)

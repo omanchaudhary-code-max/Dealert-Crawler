@@ -1,10 +1,14 @@
+import json
 import logging
 import os
 import random
 import re
+import shutil
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import undetected_chromedriver as uc
 from selenium.common.exceptions import (
@@ -41,6 +45,11 @@ SELECTORS = {
     "middleware_overlay": ".J_MIDDLEWARE_FRAME_WIDGET",
 }
 
+DELISTED_PAGE_MARKERS = [
+    "We're Sorry, an error has occurred",
+    "We seem to have lost this page",
+]
+
 MAX_RETRIES   = 3
 RETRY_BACKOFF = 5
 
@@ -58,6 +67,83 @@ def build_listing_url(category: str) -> str:
     return f"{DARAZ_BASE}/{category}/"
 
 
+def _build_proxy_auth_extension(proxy_url: str) -> str:
+    """
+    Chrome's --proxy-server flag does NOT support embedded user:pass@
+    credentials in the URL — Chrome silently strips them, leaving every
+    request unauthenticated against the proxy. The proxy then rejects
+    the connection, and Selenium just hangs until timeout
+    (manifests as ERR_NO_SUPPORTED_PROXIES in Chrome).
+
+    This builds a small temporary Chrome extension that supplies proxy
+    credentials via the chrome.webRequest.onAuthRequired API — the
+    standard workaround for authenticated proxies with Selenium/Chrome.
+
+    Returns the path to the extension directory (pass to --load-extension).
+    Caller is responsible for cleaning up the directory afterward.
+    """
+    parsed = urlparse(proxy_url)
+    host = parsed.hostname
+    port = parsed.port
+    username = parsed.username
+    password = parsed.password
+
+    if not all([host, port, username, password]):
+        raise ValueError(
+            f"PROXY_URL is missing host/port/username/password: {proxy_url!r}"
+        )
+
+    ext_dir = tempfile.mkdtemp(prefix="proxy_auth_ext_")
+
+    manifest = {
+        "manifest_version": 2,
+        "name": "Proxy Auth",
+        "version": "1.0.0",
+        "permissions": [
+            "proxy", "tabs", "unlimitedStorage", "storage",
+            "webRequest", "webRequestBlocking",
+            "<all_urls>",
+        ],
+        "background": {"scripts": ["background.js"]},
+        "minimum_chrome_version": "22.0.0",
+    }
+
+    background_js = f"""
+    var config = {{
+        mode: "fixed_servers",
+        rules: {{
+            singleProxy: {{
+                scheme: "http",
+                host: "{host}",
+                port: parseInt({port})
+            }},
+            bypassList: ["localhost"]
+        }}
+    }};
+    chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
+
+    chrome.webRequest.onAuthRequired.addListener(
+        function(details) {{
+            return {{
+                authCredentials: {{
+                    username: "{username}",
+                    password: "{password}"
+                }}
+            }};
+        }},
+        {{urls: ["<all_urls>"]}},
+        ["blocking"]
+    );
+    """
+
+    with open(os.path.join(ext_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+    with open(os.path.join(ext_dir, "background.js"), "w", encoding="utf-8") as f:
+        f.write(background_js)
+
+    return ext_dir
+
+
 class DarazCrawler:
     """
     Crawls Daraz Nepal product listing pages and extracts price data.
@@ -65,12 +151,24 @@ class DarazCrawler:
     TWO MODES controlled by CRAWL_MODE env var:
       discovery  — walk category listing pages, find new products, scrape them.
       tracking   — re-scrape already-known product URLs from MongoDB.
+
+    PROXY: set PROXY_URL env var (format: http://user:pass@host:port) to
+    route all traffic through an authenticated proxy. Credentials are
+    injected via a temporary Chrome extension since Chrome's --proxy-server
+    flag does not support inline auth.
+
+    DELISTED PRODUCTS: Daraz shows a "We're Sorry, an error has occurred"
+    page for removed/expired product URLs. This is detected fast (avoids
+    wasting the full page-load timeout + 3 retries on a dead URL) and
+    returned with is_delisted=True so the caller can mark it in MongoDB
+    and skip it on future tracking runs.
     """
 
     def __init__(self, delay_min: int = 10, delay_max: int = 20):
         self.delay_min = delay_min
         self.delay_max = delay_max
         self.driver: Optional[uc.Chrome] = None
+        self._proxy_ext_dir: Optional[str] = None
 
     # ──────────────────────────── Driver lifecycle ──────────────────────────────
 
@@ -81,27 +179,41 @@ class DarazCrawler:
         opts.add_argument("--disable-gpu")
         opts.add_argument("--window-size=1920,1080")
 
+        prefs = {
+            "profile.managed_default_content_settings.images": 2,
+            "profile.managed_default_content_settings.fonts": 2,
+        }
+        opts.add_experimental_option("prefs", prefs)
+        opts.add_argument("--blink-settings=imagesEnabled=false")
+
         if IS_CI:
             opts.add_argument("--headless=new")
-            # Extra stealth args for headless — reduces Daraz detection rate
             opts.add_argument("--disable-blink-features=AutomationControlled")
             opts.add_argument("--disable-web-security")
             opts.add_argument("--allow-running-insecure-content")
-            opts.add_argument("--disable-extensions")
-            opts.add_argument("--proxy-server=direct://")
-            opts.add_argument("--proxy-bypass-list=*")
             opts.add_argument("--start-maximized")
             opts.add_argument("--ignore-certificate-errors")
             opts.add_argument("--disable-popup-blocking")
 
+        proxy_url = os.getenv("PROXY_URL")
+        if proxy_url:
+            self._proxy_ext_dir = _build_proxy_auth_extension(proxy_url)
+            opts.add_argument(f"--load-extension={self._proxy_ext_dir}")
+            logger.info("Routing Chrome traffic through configured proxy (via auth extension).")
+        elif IS_CI:
+            logger.warning(
+                "Running in CI with NO PROXY_URL configured. "
+                "Daraz is likely to block or CAPTCHA a datacenter IP."
+            )
+
         ua = self._pick_user_agent()
         opts.add_argument(f"--user-agent={ua}")
 
-        version_main = int(os.getenv("CHROME_VER", "149"))
+        version_main_env = os.getenv("CHROME_VER")
+        version_main = int(version_main_env) if version_main_env else None
+
         driver = uc.Chrome(options=opts, version_main=version_main)
 
-        # Inject stealth JS — masks headless fingerprints that uc doesn't
-        # handle automatically in headless mode
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -135,6 +247,9 @@ class DarazCrawler:
         if self.driver:
             self.driver.quit()
             logger.info("Chrome driver closed.")
+        if self._proxy_ext_dir:
+            shutil.rmtree(self._proxy_ext_dir, ignore_errors=True)
+            logger.debug("Cleaned up temporary proxy-auth extension directory.")
 
     # ──────────────────────────── Delay utilities ───────────────────────────────
 
@@ -162,16 +277,43 @@ class DarazCrawler:
         except NoSuchElementException:
             return None
 
+    def _is_delisted_page(self) -> bool:
+        """
+        Detect Daraz's 'We're Sorry, an error has occurred' delisted/404
+        page so we fail fast instead of waiting out the full title-wait
+        timeout (which never resolves on this page) plus 3 retries.
+        """
+        try:
+            page_text = self.driver.find_element(By.TAG_NAME, "body").text
+            return any(marker in page_text for marker in DELISTED_PAGE_MARKERS)
+        except WebDriverException:
+            return False
+
+    # ──────────────────────────── Debug artifacts on failure ────────────────────
+
+    def _dump_debug_artifacts(self, url: str):
+        """
+        Save a screenshot + HTML snapshot on failure so a blocked/CAPTCHA
+        page is diagnosable from a GitHub Actions artifact instead of
+        guessing blind. Never raises — a failure here should never mask
+        the original error.
+        """
+        try:
+            os.makedirs("logs/debug", exist_ok=True)
+            safe_name = re.sub(r"[^a-zA-Z0-9]", "_", url)[-60:]
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            self.driver.save_screenshot(f"logs/debug/{ts}_{safe_name}.png")
+            with open(f"logs/debug/{ts}_{safe_name}.html", "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+        except Exception as e:
+            logger.debug(f"Could not save debug artifacts: {e}")
+
     # ──────────────────────────── Overlay dismissal ─────────────────────────────
 
     def _dismiss_overlay(self):
         """
         Dismiss Daraz's J_MIDDLEWARE_FRAME_WIDGET anti-bot overlay.
-
-        In CI/headless mode we wait longer before attempting removal because
-        headless Chrome renders and executes JS more slowly than headed mode.
         """
-        # Give the overlay extra time to self-dismiss in headless
         if IS_CI:
             time.sleep(3)
 
@@ -185,7 +327,6 @@ class DarazCrawler:
         except TimeoutException:
             pass
 
-        # JS removal
         try:
             self.driver.execute_script("""
                 var overlay = document.querySelector('.J_MIDDLEWARE_FRAME_WIDGET');
@@ -198,7 +339,6 @@ class DarazCrawler:
         except WebDriverException as e:
             logger.debug(f"JS overlay removal failed: {e}")
 
-        # Escape key fallback
         try:
             self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
             time.sleep(0.5)
@@ -229,19 +369,31 @@ class DarazCrawler:
     # ──────────────────────────── Product detail ────────────────────────────────
 
     def _scrape_product_detail(self, url: str) -> Optional[dict]:
+        match = re.search(SELECTORS["item_id_pattern"], url)
+        item_id = match.group(1) if match else None
+
         try:
             self.driver.get(url)
-            self._wait_for(SELECTORS["title"], timeout=20)
 
-            # Dismiss overlay before touching any price element
+            # Brief settle, then fast-fail check for a delisted/error page
+            # BEFORE burning the full title-wait timeout on a page that
+            # will never have a title.
+            time.sleep(1.5)
             self._dismiss_overlay()
 
-            # Extra wait in headless — page JS needs more time to render prices
+            if self._is_delisted_page():
+                logger.info(f"Product delisted/removed by Daraz: {url}")
+                return {
+                    "item_id": item_id,
+                    "url": url,
+                    "is_delisted": True,
+                    "scraped_at": datetime.now(timezone.utc),
+                }
+
+            self._wait_for(SELECTORS["title"], timeout=20)
+
             extra = 3.0 if IS_CI else 1.0
             self._polite_wait(extra=extra)
-
-            match = re.search(SELECTORS["item_id_pattern"], url)
-            item_id = match.group(1) if match else None
 
             title        = self._safe_text(SELECTORS["title"])
             raw_current  = self._safe_text(SELECTORS["current_price"])
@@ -278,6 +430,7 @@ class DarazCrawler:
 
             if not current_price:
                 logger.warning(f"No price found at {url}")
+                self._dump_debug_artifacts(url)
                 return None
 
             return {
@@ -291,19 +444,28 @@ class DarazCrawler:
                 "image_url":      image_url,
                 "image_verified": image_url is not None,
                 "scraped_at":     datetime.now(timezone.utc),
+                "source":         "crawler",
+                "is_delisted":    False,
             }
 
         except TimeoutException:
             logger.warning(f"Timeout loading product page: {url}")
+            self._dump_debug_artifacts(url)
             return None
         except WebDriverException as e:
             logger.error(f"WebDriver error on {url}: {e}")
+            self._dump_debug_artifacts(url)
             return None
 
     def _scrape_with_retry(self, url: str) -> Optional[dict]:
         for attempt in range(1, MAX_RETRIES + 1):
             result = self._scrape_product_detail(url)
+
             if result is not None:
+                if result.get("is_delisted"):
+                    logger.info(f"  Confirmed delisted, not retrying: {url}")
+                    return result
+
                 if attempt > 1:
                     logger.info(f"  ✓ Succeeded on attempt {attempt}: {url}")
                 return result
@@ -349,6 +511,7 @@ class DarazCrawler:
             self._polite_wait()
         except TimeoutException:
             logger.warning(f"Timeout on listing page 1 for /{category}/, stopping category.")
+            self._dump_debug_artifacts(listing_url)
             return links
         except WebDriverException as e:
             logger.error(f"WebDriver error loading {listing_url}: {e}")
@@ -360,6 +523,7 @@ class DarazCrawler:
             cards_before = self.driver.find_elements(By.CSS_SELECTOR, SELECTORS["product_cards"])
             if not cards_before:
                 logger.info(f"No products on page {page}, stopping.")
+                self._dump_debug_artifacts(listing_url)
                 break
 
             self._extract_links_from_current_page(links, max_products)
@@ -414,7 +578,6 @@ class DarazCrawler:
     ) -> list[dict]:
         """
         DISCOVERY MODE — walk listing pages, find new products, scrape them.
-        Use during Phase 1 (now → July 15) to build your product basket.
         """
         logger.info(f"=== [DISCOVERY] Crawling category: {category} (max {max_products}) ===")
         links = self._collect_product_links(category, max_products)
@@ -457,13 +620,13 @@ class DarazCrawler:
     ) -> list[dict]:
         """
         TRACKING MODE — re-scrape a pre-known list of products from MongoDB.
-        Use during Phase 2 (July 15 → July 30) to build deep price history.
         """
         logger.info(f"=== [TRACKING] Re-scraping {len(products)} known products ===")
 
-        results      = []
-        saved_count  = 0
-        failed_count = 0
+        results        = []
+        saved_count    = 0
+        failed_count   = 0
+        delisted_count = 0
 
         for i, product in enumerate(products, 1):
             url      = product.get("url")
@@ -482,6 +645,9 @@ class DarazCrawler:
                 data["category"] = category
                 results.append(data)
 
+                if data.get("is_delisted"):
+                    delisted_count += 1
+
                 if save_callback:
                     try:
                         save_callback(data)
@@ -496,6 +662,7 @@ class DarazCrawler:
         logger.info(
             f"=== Tracking run done: "
             f"{len(results)} scraped, {saved_count} saved immediately, "
+            f"{delisted_count} newly delisted, "
             f"{failed_count} failed after {MAX_RETRIES} retries ==="
         )
         return results
