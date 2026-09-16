@@ -53,7 +53,7 @@ jobs:
           PROXY_URL: ${{ secrets.PROXY_URL }}
           DELAY_MIN: 10
           DELAY_MAX: 20
-          MAX_PRODUCTS_PER_CATEGORY: 50
+          MAX_PRODUCTS_PER_CATEGORY: 15
           CATEGORIES: laptops,smartphones,televisions,earphones-headsets,mens-shoes,womens-shoes,mens-t-shirts,books,kitchen-appliances,cameras
           CRAWL_MODE: discovery
           LOG_LEVEL: INFO
