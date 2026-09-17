@@ -71,13 +71,10 @@ def _build_proxy_auth_extension(proxy_url: str) -> str:
     """
     Chrome's --proxy-server flag does NOT support embedded user:pass@
     credentials in the URL — Chrome silently strips them, leaving every
-    request unauthenticated against the proxy. The proxy then rejects
-    the connection, and Selenium just hangs until timeout
-    (manifests as ERR_NO_SUPPORTED_PROXIES in Chrome).
-
-    This builds a small temporary Chrome extension that supplies proxy
-    credentials via the chrome.webRequest.onAuthRequired API — the
-    standard workaround for authenticated proxies with Selenium/Chrome.
+    request unauthenticated against the proxy. This builds a small
+    temporary Chrome extension that supplies proxy credentials via the
+    chrome.webRequest.onAuthRequired API — the standard workaround for
+    authenticated proxies with Selenium/Chrome.
 
     Returns the path to the extension directory (pass to --load-extension).
     Caller is responsible for cleaning up the directory afterward.
@@ -157,6 +154,14 @@ class DarazCrawler:
     injected via a temporary Chrome extension since Chrome's --proxy-server
     flag does not support inline auth.
 
+    CHROME/CHROMEDRIVER VERSION: if CHROME_BINARY_PATH and CHROMEDRIVER_PATH
+    are set (as done by the CI workflow, which downloads both from Google's
+    Chrome for Testing manifest so they're guaranteed to be the same
+    release), those exact binaries are used directly — no auto-detection,
+    no possibility of a version-skew mismatch. If unset (typical for local
+    dev), falls back to CHROME_VER (explicit major-version pin) or full
+    auto-detection via undetected_chromedriver.
+
     DELISTED PRODUCTS: Daraz shows a "We're Sorry, an error has occurred"
     page for removed/expired product URLs. This is detected fast (avoids
     wasting the full page-load timeout + 3 retries on a dead URL) and
@@ -209,10 +214,27 @@ class DarazCrawler:
         ua = self._pick_user_agent()
         opts.add_argument(f"--user-agent={ua}")
 
-        version_main_env = os.getenv("CHROME_VER")
-        version_main = int(version_main_env) if version_main_env else None
+        chrome_binary_path = os.getenv("CHROME_BINARY_PATH")
+        chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
 
-        driver = uc.Chrome(options=opts, version_main=version_main)
+        driver_kwargs = {"options": opts}
+
+        if chrome_binary_path and chromedriver_path:
+            # Both binaries downloaded together from Chrome for Testing's
+            # manifest — guaranteed matched versions, no skew possible.
+            opts.binary_location = chrome_binary_path
+            driver_kwargs["driver_executable_path"] = chromedriver_path
+            logger.info(
+                f"Using explicit matched Chrome/ChromeDriver binaries: "
+                f"{chrome_binary_path} / {chromedriver_path}"
+            )
+        else:
+            # Local dev fallback: explicit major-version pin if given,
+            # otherwise let undetected_chromedriver auto-detect.
+            version_main_env = os.getenv("CHROME_VER")
+            driver_kwargs["version_main"] = int(version_main_env) if version_main_env else None
+
+        driver = uc.Chrome(**driver_kwargs)
 
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
@@ -375,9 +397,6 @@ class DarazCrawler:
         try:
             self.driver.get(url)
 
-            # Brief settle, then fast-fail check for a delisted/error page
-            # BEFORE burning the full title-wait timeout on a page that
-            # will never have a title.
             time.sleep(1.5)
             self._dismiss_overlay()
 
